@@ -1,5 +1,5 @@
 from fastmcp import FastMCP
-from fastapi import FastAPI
+
 import random
 import json
 
