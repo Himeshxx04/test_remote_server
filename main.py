@@ -1,6 +1,6 @@
 from fastmcp import FastMCP
 import os
-import sqlite3
+import aiosqlite
 import tempfile
 import json
 
@@ -13,11 +13,12 @@ print(f"Database path: {DB_PATH}")
 
 mcp = FastMCP("ExpenseTracker")
 
+# ------------------ INIT DB (sync) ------------------
 def init_db():
     try:
-        # Create database with explicit write permissions and WAL mode
+        import sqlite3
         with sqlite3.connect(DB_PATH) as c:
-            c.execute("PRAGMA journal_mode=WAL") 
+            c.execute("PRAGMA journal_mode=WAL")
             c.execute("""
                 CREATE TABLE IF NOT EXISTS expenses(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -28,7 +29,6 @@ def init_db():
                     note TEXT DEFAULT ''
                 )
             """)
-            # Test write access
             c.execute("INSERT OR IGNORE INTO expenses(date, amount, category) VALUES ('2000-01-01', 0, 'test')")
             c.execute("DELETE FROM expenses WHERE category = 'test'")
             print("Database initialized successfully with write access")
@@ -36,31 +36,34 @@ def init_db():
         print(f"Database initialization error: {e}")
         raise
 
-# Initialize DB on startup
 init_db()
 
+# ------------------ TOOLS (ALL ASYNC) ------------------
+
 @mcp.tool()
-def add_expense(date, amount, category, subcategory="", note=""):
+async def add_expense(date, amount, category, subcategory="", note=""):
     '''Add a new expense entry to the database.'''
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
                 "INSERT INTO expenses(date, amount, category, subcategory, note) VALUES (?,?,?,?,?)",
                 (date, amount, category, subcategory, note)
             )
-            c.commit()
-            return {"status": "success", "id": cur.lastrowid, "message": "Expense added successfully"}
-    except sqlite3.OperationalError as e:
-        return {"status": "error", "message": f"Database error: {str(e)}"}
+            expense_id = cur.lastrowid
+            await c.commit()
+            return {"status": "success", "id": expense_id, "message": "Expense added successfully"}
     except Exception as e:
-        return {"status": "error", "message": f"Unexpected error: {str(e)}"}
+        if "readonly" in str(e).lower():
+            return {"status": "error", "message": "Database is in read-only mode. Check file permissions."}
+        return {"status": "error", "message": f"Database error: {str(e)}"}
+
 
 @mcp.tool()
-def list_expenses(start_date, end_date):
+async def list_expenses(start_date, end_date):
     '''List expense entries within an inclusive date range.'''
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(
                 """
                 SELECT id, date, amount, category, subcategory, note
                 FROM expenses
@@ -70,15 +73,16 @@ def list_expenses(start_date, end_date):
                 (start_date, end_date)
             )
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
         return {"status": "error", "message": f"Error listing expenses: {str(e)}"}
 
+
 @mcp.tool()
-def summarize(start_date, end_date, category=None):
+async def summarize(start_date, end_date, category=None):
     '''Summarize expenses by category within an inclusive date range.'''
     try:
-        with sqlite3.connect(DB_PATH) as c:
+        async with aiosqlite.connect(DB_PATH) as c:
             query = """
                 SELECT category, SUM(amount) AS total_amount, COUNT(*) as count
                 FROM expenses
@@ -92,27 +96,29 @@ def summarize(start_date, end_date, category=None):
 
             query += " GROUP BY category ORDER BY total_amount DESC"
 
-            cur = c.execute(query, params)
+            cur = await c.execute(query, params)
             cols = [d[0] for d in cur.description]
-            return [dict(zip(cols, r)) for r in cur.fetchall()]
+            return [dict(zip(cols, r)) for r in await cur.fetchall()]
     except Exception as e:
         return {"status": "error", "message": f"Error summarizing expenses: {str(e)}"}
 
+
 @mcp.tool()
-def delete_expense(id: int):
+async def delete_expense(id: int):
     '''Delete an expense entry by its ID.'''
     try:
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute("DELETE FROM expenses WHERE id = ?", (id,))
-            c.commit()
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute("DELETE FROM expenses WHERE id = ?", (id,))
+            await c.commit()
             if cur.rowcount == 0:
                 return {"status": "error", "message": f"No expense found with id {id}"}
             return {"status": "ok", "deleted_id": id}
     except Exception as e:
         return {"status": "error", "message": f"Database error: {str(e)}"}
 
+
 @mcp.tool()
-def update_expense(id: int, date=None, amount=None, category=None, subcategory=None, note=None):
+async def update_expense(id: int, date=None, amount=None, category=None, subcategory=None, note=None):
     '''Update one or more fields of an existing expense entry by its ID.'''
     fields = {k: v for k, v in locals().items() if v is not None and k != "id"}
 
@@ -123,14 +129,15 @@ def update_expense(id: int, date=None, amount=None, category=None, subcategory=N
         set_clause = ", ".join(f"{k} = ?" for k in fields)
         params = list(fields.values()) + [id]
 
-        with sqlite3.connect(DB_PATH) as c:
-            cur = c.execute(f"UPDATE expenses SET {set_clause} WHERE id = ?", params)
-            c.commit()
+        async with aiosqlite.connect(DB_PATH) as c:
+            cur = await c.execute(f"UPDATE expenses SET {set_clause} WHERE id = ?", params)
+            await c.commit()
             if cur.rowcount == 0:
                 return {"status": "error", "message": f"No expense found with id {id}"}
             return {"status": "ok", "updated_id": id}
     except Exception as e:
         return {"status": "error", "message": f"Database error: {str(e)}"}
+
 
 @mcp.resource("expense://categories", mime_type="application/json")
 def categories():
@@ -150,6 +157,8 @@ def categories():
     except Exception as e:
         return json.dumps({"error": f"Could not load categories: {str(e)}"})
 
-# Start the server
+
+# ------------------ RUN ------------------
+
 if __name__ == "__main__":
-    mcp.run()
+    mcp.run(transport="http", host="0.0.0.0", port=8000)
